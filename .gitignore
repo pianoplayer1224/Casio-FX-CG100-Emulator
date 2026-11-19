@@ -1,0 +1,21 @@
+# Filmed benchmarks: 33 GB of video plus calculator photos (tools/glyphdecode.py
+# reads the photos). Too big for git; keep them backed up separately.
+bm_core_videos/
+
+# Upstream MicroPython v1.9.4 checkout with its own .git. Our changes are
+# tracked in emu/port/cg100/ and emu/patches/ (see emu/port.sh).
+emu/micropython/
+
+# Build output and local backups
+emu/viewer
+emu/backups/
+
+# Python and editor junk
+__pycache__/
+*.pyc
+*.swp
+*~
+.DS_Store
+
+# User's own test games (Bad Apple, fd, missing_op), not part of the emulator
+user_files/

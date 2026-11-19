@@ -1,0 +1,40 @@
+#!/bin/sh
+# Run a calculator script in the fx-CG100 emulator, at the calculator's speed.
+#
+#     emu/cg100 SCRIPT.py          screen window + real-time speed
+#     emu/cg100 --fast SCRIPT.py   as fast as the PC can (virtual time still kept)
+#     emu/cg100 --headless ...     no window
+#
+# The window shows the calculator's screen: the shell (print() output, also
+# copied to this terminal) or casioplot's canvas. Type in the window (or this
+# terminal) to answer input() and, after the script, at the >>> prompt.
+# A drawing stays until a key is pressed. Esc = AC. Close the window to quit.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+SHM="/dev/shm/cg100-$(id -u)-$$"
+window=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --fast) export CG100_FAST=1; shift ;;
+    --headless) window=0; shift ;;
+    *) break ;;
+  esac
+done
+[ $# -ge 1 ] || { sed -n '2,11p' "$0"; exit 2; }
+export CG100_COSTS="$HERE/costs.txt"
+# turtle and matplotlib
+export MICROPYPATH="$HERE/lib"
+if [ $window = 1 ]; then
+  "$HERE/viewer" "$SHM" &
+  viewer=$!
+  # wait for the viewer to create the screen
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$SHM" ] && break; sleep 0.1; done
+  export CG100_SHM="$SHM"
+fi
+cd "$(dirname "$1")" && "$HERE/micropython/ports/cg100/micropython" "$(basename "$1")"
+status=$?
+if [ $window = 1 ]; then
+  # the emulator stops when the window closes; if it stopped first, say so
+  kill -0 $viewer 2>/dev/null && echo "(close the window to exit)"
+  wait $viewer
+fi
+exit $status

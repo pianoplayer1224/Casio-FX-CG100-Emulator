@@ -1,0 +1,575 @@
+diff --git a/py/builtinimport.c b/py/builtinimport.c
+index b8ed096..a1aa237 100644
+--- a/py/builtinimport.c
++++ b/py/builtinimport.c
+@@ -35,6 +35,9 @@
+ #include "py/runtime.h"
+ #include "py/builtin.h"
+ #include "py/frozenmod.h"
++#if MICROPY_CG_TIMING
++#include "cgtime.h"
++#endif
+ 
+ #if MICROPY_DEBUG_VERBOSE // print debugging info
+ #define DEBUG_PRINT (1)
+@@ -224,6 +227,16 @@ STATIC void do_load(mp_obj_t module_obj, vstr_t *file) {
+     // If we can compile scripts then load the file and compile and execute it.
+     #if MICROPY_ENABLE_COMPILER
+     {
++        #if MICROPY_CG_TIMING
++        // fx-CG100: assumed to refuse a module as it refuses a script
++        size_t long_len;
++        int long_line = cg_long_line(file_str, &long_len);
++        if (long_line) {
++            nlr_raise(mp_obj_new_exception_msg_varg(&mp_type_ImportError,
++                "Invalid Data Size\n%s line %d: %d characters",
++                strrchr(file_str, '/') ? strrchr(file_str, '/') + 1 : file_str, long_line, (int)long_len));
++        }
++        #endif
+         mp_lexer_t *lex = mp_lexer_new_from_file(file_str);
+         do_load_from_lexer(module_obj, lex);
+         return;
+diff --git a/py/compile.c b/py/compile.c
+index 9200b34..0aaf206 100644
+--- a/py/compile.c
++++ b/py/compile.c
+@@ -1954,6 +1954,12 @@ STATIC void compile_expr_stmt(compiler_t *comp, mp_parse_node_struct_t *pns) {
+                         )
+                     && !MP_PARSE_NODE_IS_STRUCT_KIND(pns0->nodes[0], PN_star_expr)
+                     && !MP_PARSE_NODE_IS_STRUCT_KIND(pns0->nodes[1], PN_star_expr)
++                    #if MICROPY_CG_TIMING
++                    // fx-CG100: only plain names are swapped on the stack;
++                    // l[j],l[j+1]=... builds a tuple (bm_gap swap: 1.7 ms)
++                    && MP_PARSE_NODE_IS_ID(pns0->nodes[0]) && MP_PARSE_NODE_IS_ID(pns0->nodes[1])
++                    && (n_pns0 == 2 || MP_PARSE_NODE_IS_ID(pns0->nodes[2]))
++                    #endif
+                     #if MICROPY_COMP_TRIPLE_TUPLE_ASSIGN
+                     && (n_pns0 == 2 || !MP_PARSE_NODE_IS_STRUCT_KIND(pns0->nodes[2], PN_star_expr))
+                     #endif
+diff --git a/py/gc.c b/py/gc.c
+index 84c9918..5650175 100644
+--- a/py/gc.c
++++ b/py/gc.c
+@@ -29,6 +29,9 @@
+ #include <string.h>
+ 
+ #include "py/gc.h"
++#if MICROPY_CG_TIMING
++#include "cgtime.h"
++#endif
+ #include "py/runtime.h"
+ 
+ #if MICROPY_ENABLE_GC
+@@ -216,6 +219,9 @@ STATIC void gc_mark_subtree(size_t block) {
+         do {
+             n_blocks += 1;
+         } while (ATB_GET_KIND(block + n_blocks) == AT_TAIL);
++        #if MICROPY_CG_TIMING
++        cg_event(CG_EV_GC_MARK, n_blocks);
++        #endif
+ 
+         // check this block's children
+         void **ptrs = (void**)PTR_FROM_BLOCK(block);
+@@ -353,6 +359,9 @@ void gc_collect_root(void **ptrs, size_t len) {
+ }
+ 
+ void gc_collect_end(void) {
++    #if MICROPY_CG_TIMING
++    cg_event(CG_EV_GC, 1);
++    #endif
+     gc_deal_with_stack_overflow();
+     gc_sweep();
+     MP_STATE_MEM(gc_last_free_atb_index) = 0;
+@@ -441,6 +450,10 @@ void *gc_alloc(size_t n_bytes, bool has_finaliser) {
+         return NULL;
+     }
+ 
++    #if MICROPY_CG_TIMING
++    cg_event(CG_EV_ALLOC, 1);
++    #endif
++
+     size_t i;
+     size_t end_block;
+     size_t start_block;
+@@ -460,6 +473,9 @@ void *gc_alloc(size_t n_bytes, bool has_finaliser) {
+         // look for a run of n_blocks available blocks
+         for (i = MP_STATE_MEM(gc_last_free_atb_index); i < MP_STATE_MEM(gc_alloc_table_byte_len); i++) {
+             byte a = MP_STATE_MEM(gc_alloc_table_start)[i];
++            #if MICROPY_CG_TIMING
++            cg_count[CG_EV_ALLOC_SCAN]++;
++            #endif
+             if (ATB_0_IS_FREE(a)) { if (++n_free >= n_blocks) { i = i * BLOCKS_PER_ATB + 0; goto found; } } else { n_free = 0; }
+             if (ATB_1_IS_FREE(a)) { if (++n_free >= n_blocks) { i = i * BLOCKS_PER_ATB + 1; goto found; } } else { n_free = 0; }
+             if (ATB_2_IS_FREE(a)) { if (++n_free >= n_blocks) { i = i * BLOCKS_PER_ATB + 2; goto found; } } else { n_free = 0; }
+diff --git a/py/lexer.c b/py/lexer.c
+index 6017d69..2326b45 100644
+--- a/py/lexer.c
++++ b/py/lexer.c
+@@ -30,6 +30,9 @@
+ 
+ #include "py/reader.h"
+ #include "py/lexer.h"
++#if MICROPY_CG_TIMING
++#include "cgtime.h"
++#endif
+ #include "py/runtime.h"
+ 
+ #if MICROPY_ENABLE_COMPILER
+@@ -135,6 +138,10 @@ STATIC void next_char(mp_lexer_t *lex) {
+     lex->chr0 = lex->chr1;
+     lex->chr1 = lex->chr2;
+     lex->chr2 = lex->reader.readbyte(lex->reader.data);
++    #if MICROPY_CG_TIMING
++    // fx-CG100: compiling source (an import) takes time on the calculator
++    cg_event(CG_EV_LEX_CHAR, 1);
++    #endif
+ 
+     if (lex->chr1 == '\r') {
+         // CR is a new line, converted to LF
+diff --git a/py/map.c b/py/map.c
+index 6abf485..6c64a0e 100644
+--- a/py/map.c
++++ b/py/map.c
+@@ -32,6 +32,9 @@
+ #include "py/mpconfig.h"
+ #include "py/misc.h"
+ #include "py/runtime.h"
++#if MICROPY_CG_TIMING
++#include "cgtime.h"
++#endif
+ 
+ #if MICROPY_DEBUG_VERBOSE // print debugging info
+ #define DEBUG_PRINT (1)
+@@ -169,6 +172,9 @@ mp_map_elem_t *mp_map_lookup(mp_map_t *map, mp_obj_t index, mp_map_lookup_kind_t
+     // if the map is an ordered array then we must do a brute force linear search
+     if (map->is_ordered) {
+         for (mp_map_elem_t *elem = &map->table[0], *top = &map->table[map->used]; elem < top; elem++) {
++            #if MICROPY_CG_TIMING
++            cg_count[CG_EV_MAP_SCAN]++;
++            #endif
+             if (elem->key == index || (!compare_only_ptrs && mp_obj_equal(elem->key, index))) {
+                 #if MICROPY_PY_COLLECTIONS_ORDEREDDICT
+                 if (MP_UNLIKELY(lookup_kind == MP_MAP_LOOKUP_REMOVE_IF_FOUND)) {
+@@ -228,6 +234,9 @@ mp_map_elem_t *mp_map_lookup(mp_map_t *map, mp_obj_t index, mp_map_lookup_kind_t
+     size_t start_pos = pos;
+     mp_map_elem_t *avail_slot = NULL;
+     for (;;) {
++        #if MICROPY_CG_TIMING
++        cg_count[CG_EV_MAP_PROBE]++;
++        #endif
+         mp_map_elem_t *slot = &map->table[pos];
+         if (slot->key == MP_OBJ_NULL) {
+             // found NULL slot, so index is not in table
+diff --git a/py/modbuiltins.c b/py/modbuiltins.c
+index 0d51133..53c67c9 100644
+--- a/py/modbuiltins.c
++++ b/py/modbuiltins.c
+@@ -34,6 +34,9 @@
+ #include "py/runtime.h"
+ #include "py/builtin.h"
+ #include "py/stream.h"
++#if MICROPY_CG_TIMING
++#include "cgtime.h"
++#endif
+ 
+ #if MICROPY_PY_BUILTINS_FLOAT
+ #include <math.h>
+@@ -475,6 +478,9 @@ STATIC mp_obj_t mp_builtin_sum(size_t n_args, const mp_obj_t *args) {
+     mp_obj_t iterable = mp_getiter(args[0], &iter_buf);
+     mp_obj_t item;
+     while ((item = mp_iternext(iterable)) != MP_OBJ_STOP_ITERATION) {
++        #if MICROPY_CG_TIMING
++        cg_event(CG_EV_SUM_ITEM, 1);
++        #endif
+         value = mp_binary_op(MP_BINARY_OP_ADD, value, item);
+     }
+     return value;
+@@ -564,8 +570,10 @@ STATIC const mp_rom_map_elem_t mp_module_builtins_globals_table[] = {
+     { MP_ROM_QSTR(MP_QSTR_bool), MP_ROM_PTR(&mp_type_bool) },
+     { MP_ROM_QSTR(MP_QSTR_bytes), MP_ROM_PTR(&mp_type_bytes) },
+     #if MICROPY_PY_BUILTINS_BYTEARRAY
++    #if !MICROPY_CG_NAMES  // missing on the fx-CG100 (the type is still used inside)
+     { MP_ROM_QSTR(MP_QSTR_bytearray), MP_ROM_PTR(&mp_type_bytearray) },
+     #endif
++    #endif
+     #if MICROPY_PY_BUILTINS_COMPLEX
+     { MP_ROM_QSTR(MP_QSTR_complex), MP_ROM_PTR(&mp_type_complex) },
+     #endif
+diff --git a/py/modmath.c b/py/modmath.c
+index 7eda759..b054345 100644
+--- a/py/modmath.c
++++ b/py/modmath.c
+@@ -240,19 +240,29 @@ STATIC const mp_rom_map_elem_t mp_module_math_globals_table[] = {
+     { MP_ROM_QSTR(MP_QSTR_pow), MP_ROM_PTR(&mp_math_pow_obj) },
+     { MP_ROM_QSTR(MP_QSTR_exp), MP_ROM_PTR(&mp_math_exp_obj) },
+     #if MICROPY_PY_MATH_SPECIAL_FUNCTIONS
++    #if !MICROPY_CG_NAMES  // missing on the fx-CG100
+     { MP_ROM_QSTR(MP_QSTR_expm1), MP_ROM_PTR(&mp_math_expm1_obj) },
+     #endif
++    #endif
+     { MP_ROM_QSTR(MP_QSTR_log), MP_ROM_PTR(&mp_math_log_obj) },
+     #if MICROPY_PY_MATH_SPECIAL_FUNCTIONS
++    #if !MICROPY_CG_NAMES  // missing on the fx-CG100
+     { MP_ROM_QSTR(MP_QSTR_log2), MP_ROM_PTR(&mp_math_log2_obj) },
++    #endif
+     { MP_ROM_QSTR(MP_QSTR_log10), MP_ROM_PTR(&mp_math_log10_obj) },
+     { MP_ROM_QSTR(MP_QSTR_cosh), MP_ROM_PTR(&mp_math_cosh_obj) },
+     { MP_ROM_QSTR(MP_QSTR_sinh), MP_ROM_PTR(&mp_math_sinh_obj) },
+     { MP_ROM_QSTR(MP_QSTR_tanh), MP_ROM_PTR(&mp_math_tanh_obj) },
++    #if !MICROPY_CG_NAMES  // missing on the fx-CG100
+     { MP_ROM_QSTR(MP_QSTR_acosh), MP_ROM_PTR(&mp_math_acosh_obj) },
++    #endif
++    #if !MICROPY_CG_NAMES  // missing on the fx-CG100
+     { MP_ROM_QSTR(MP_QSTR_asinh), MP_ROM_PTR(&mp_math_asinh_obj) },
++    #endif
++    #if !MICROPY_CG_NAMES  // missing on the fx-CG100
+     { MP_ROM_QSTR(MP_QSTR_atanh), MP_ROM_PTR(&mp_math_atanh_obj) },
+     #endif
++    #endif
+     { MP_ROM_QSTR(MP_QSTR_cos), MP_ROM_PTR(&mp_math_cos_obj) },
+     { MP_ROM_QSTR(MP_QSTR_sin), MP_ROM_PTR(&mp_math_sin_obj) },
+     { MP_ROM_QSTR(MP_QSTR_tan), MP_ROM_PTR(&mp_math_tan_obj) },
+@@ -261,25 +271,47 @@ STATIC const mp_rom_map_elem_t mp_module_math_globals_table[] = {
+     { MP_ROM_QSTR(MP_QSTR_atan), MP_ROM_PTR(&mp_math_atan_obj) },
+     { MP_ROM_QSTR(MP_QSTR_atan2), MP_ROM_PTR(&mp_math_atan2_obj) },
+     { MP_ROM_QSTR(MP_QSTR_ceil), MP_ROM_PTR(&mp_math_ceil_obj) },
++    #if !MICROPY_CG_NAMES  // missing on the fx-CG100
+     { MP_ROM_QSTR(MP_QSTR_copysign), MP_ROM_PTR(&mp_math_copysign_obj) },
++    #endif
+     { MP_ROM_QSTR(MP_QSTR_fabs), MP_ROM_PTR(&mp_math_fabs_obj) },
+     { MP_ROM_QSTR(MP_QSTR_floor), MP_ROM_PTR(&mp_math_floor_obj) },
+     { MP_ROM_QSTR(MP_QSTR_fmod), MP_ROM_PTR(&mp_math_fmod_obj) },
+     { MP_ROM_QSTR(MP_QSTR_frexp), MP_ROM_PTR(&mp_math_frexp_obj) },
+     { MP_ROM_QSTR(MP_QSTR_ldexp), MP_ROM_PTR(&mp_math_ldexp_obj) },
+     { MP_ROM_QSTR(MP_QSTR_modf), MP_ROM_PTR(&mp_math_modf_obj) },
++    #if !MICROPY_CG_NAMES  // missing on the fx-CG100
+     { MP_ROM_QSTR(MP_QSTR_isfinite), MP_ROM_PTR(&mp_math_isfinite_obj) },
++    #endif
++    #if !MICROPY_CG_NAMES  // missing on the fx-CG100
+     { MP_ROM_QSTR(MP_QSTR_isinf), MP_ROM_PTR(&mp_math_isinf_obj) },
++    #endif
++    #if !MICROPY_CG_NAMES  // missing on the fx-CG100
+     { MP_ROM_QSTR(MP_QSTR_isnan), MP_ROM_PTR(&mp_math_isnan_obj) },
++    #endif
++    #if !MICROPY_CG_NAMES  // missing on the fx-CG100
+     { MP_ROM_QSTR(MP_QSTR_trunc), MP_ROM_PTR(&mp_math_trunc_obj) },
++    #endif
++    #if !MICROPY_CG_NAMES  // missing on the fx-CG100
+     { MP_ROM_QSTR(MP_QSTR_radians), MP_ROM_PTR(&mp_math_radians_obj) },
++    #endif
++    #if !MICROPY_CG_NAMES  // missing on the fx-CG100
+     { MP_ROM_QSTR(MP_QSTR_degrees), MP_ROM_PTR(&mp_math_degrees_obj) },
++    #endif
+     #if MICROPY_PY_MATH_SPECIAL_FUNCTIONS
++    #if !MICROPY_CG_NAMES  // missing on the fx-CG100
+     { MP_ROM_QSTR(MP_QSTR_erf), MP_ROM_PTR(&mp_math_erf_obj) },
++    #endif
++    #if !MICROPY_CG_NAMES  // missing on the fx-CG100
+     { MP_ROM_QSTR(MP_QSTR_erfc), MP_ROM_PTR(&mp_math_erfc_obj) },
++    #endif
++    #if !MICROPY_CG_NAMES  // missing on the fx-CG100
+     { MP_ROM_QSTR(MP_QSTR_gamma), MP_ROM_PTR(&mp_math_gamma_obj) },
++    #endif
++    #if !MICROPY_CG_NAMES  // missing on the fx-CG100
+     { MP_ROM_QSTR(MP_QSTR_lgamma), MP_ROM_PTR(&mp_math_lgamma_obj) },
+     #endif
++    #endif
+ };
+ 
+ STATIC MP_DEFINE_CONST_DICT(mp_module_math_globals, mp_module_math_globals_table);
+diff --git a/py/mpconfig.h b/py/mpconfig.h
+index 532b54a..3aa789b 100644
+--- a/py/mpconfig.h
++++ b/py/mpconfig.h
+@@ -233,6 +233,26 @@
+ #define alloca(x) m_malloc(x)
+ #endif
+ 
++// fx-CG100 emulator: count work for the timing model (emu/)
++#ifndef MICROPY_CG_TIMING
++#define MICROPY_CG_TIMING (0)
++#endif
++
++// fx-CG100 emulator: import only the calculator's modules
++#ifndef MICROPY_CG_MODULES
++#define MICROPY_CG_MODULES (0)
++#endif
++
++// fx-CG100 emulator: leave out the builtins and math functions the calculator lacks
++#ifndef MICROPY_CG_NAMES
++#define MICROPY_CG_NAMES (0)
++#endif
++
++// fx-CG100 emulator: extra bytes allocated per tuple, to match its heap use
++#ifndef MICROPY_CG_TUPLE_PAD
++#define MICROPY_CG_TUPLE_PAD (0)
++#endif
++
+ /*****************************************************************************/
+ /* MicroPython emitters                                                     */
+ 
+diff --git a/py/obj.c b/py/obj.c
+index a1de89a..069b10a 100644
+--- a/py/obj.c
++++ b/py/obj.c
+@@ -35,6 +35,9 @@
+ #include "py/objstr.h"
+ #include "py/runtime.h"
+ #include "py/stackctrl.h"
++#if MICROPY_CG_TIMING
++#include "cgtime.h"
++#endif
+ #include "py/stream.h" // for mp_obj_print
+ 
+ mp_obj_type_t *mp_obj_get_type(mp_const_obj_t o_in) {
+@@ -465,6 +468,9 @@ mp_obj_t mp_obj_len_maybe(mp_obj_t o_in) {
+ }
+ 
+ mp_obj_t mp_obj_subscr(mp_obj_t base, mp_obj_t index, mp_obj_t value) {
++    #if MICROPY_CG_TIMING
++    cg_count_subscr(value != MP_OBJ_SENTINEL, (uintptr_t)base);
++    #endif
+     mp_obj_type_t *type = mp_obj_get_type(base);
+     if (type->subscr != NULL) {
+         mp_obj_t ret = type->subscr(base, index, value);
+diff --git a/py/objint.c b/py/objint.c
+index 270e169..8b6261a 100644
+--- a/py/objint.c
++++ b/py/objint.c
+@@ -34,6 +34,9 @@
+ #include "py/objstr.h"
+ #include "py/runtime.h"
+ #include "py/binary.h"
++#if MICROPY_CG_TIMING
++#include "cgtime.h"
++#endif
+ 
+ #if MICROPY_PY_BUILTINS_FLOAT
+ #include <math.h>
+@@ -407,6 +410,9 @@ STATIC mp_obj_t int_from_bytes(size_t n_args, const mp_obj_t *args) {
+         #if MICROPY_LONGINT_IMPL != MICROPY_LONGINT_IMPL_NONE
+         if (value > (MP_SMALL_INT_MAX >> 8)) {
+             // Result will overflow a small-int so construct a big-int
++            #if MICROPY_CG_TIMING
++            cg_event(CG_EV_INT_BYTES, bufinfo.len);
++            #endif
+             return mp_obj_int_from_bytes_impl(args[2] != MP_OBJ_NEW_QSTR(MP_QSTR_little), bufinfo.len, bufinfo.buf);
+         }
+         #endif
+@@ -435,6 +441,9 @@ STATIC mp_obj_t int_to_bytes(size_t n_args, const mp_obj_t *args) {
+ 
+     #if MICROPY_LONGINT_IMPL != MICROPY_LONGINT_IMPL_NONE
+     if (!MP_OBJ_IS_SMALL_INT(args[0])) {
++        #if MICROPY_CG_TIMING
++        cg_event(CG_EV_INT_BYTES, len);
++        #endif
+         mp_obj_int_to_bytes_impl(args[0], big_endian, len, data);
+     } else
+     #endif
+diff --git a/py/objmodule.c b/py/objmodule.c
+index c4aba3a..206c840 100644
+--- a/py/objmodule.c
++++ b/py/objmodule.c
+@@ -132,6 +132,13 @@ mp_obj_dict_t *mp_obj_module_get_globals(mp_obj_t self_in) {
+ // Global module table and related functions
+ 
+ STATIC const mp_rom_map_elem_t mp_builtin_module_table[] = {
++#if MICROPY_CG_MODULES
++    // fx-CG100: only the modules the calculator has (cginfo.py); sys etc.
++    // stay compiled in because the port's C code uses them
++    { MP_ROM_QSTR(MP_QSTR___main__), MP_ROM_PTR(&mp_module___main__) },
++    { MP_ROM_QSTR(MP_QSTR_builtins), MP_ROM_PTR(&mp_module_builtins) },
++    { MP_ROM_QSTR(MP_QSTR_math), MP_ROM_PTR(&mp_module_math) },
++#else
+     { MP_ROM_QSTR(MP_QSTR___main__), MP_ROM_PTR(&mp_module___main__) },
+     { MP_ROM_QSTR(MP_QSTR_builtins), MP_ROM_PTR(&mp_module_builtins) },
+     { MP_ROM_QSTR(MP_QSTR_micropython), MP_ROM_PTR(&mp_module_micropython) },
+@@ -221,6 +228,8 @@ STATIC const mp_rom_map_elem_t mp_builtin_module_table[] = {
+     { MP_ROM_QSTR(MP_QSTR_btree), MP_ROM_PTR(&mp_module_btree) },
+ #endif
+ 
++#endif // MICROPY_CG_MODULES
++
+     // extra builtin modules as defined by a port
+     MICROPY_PORT_BUILTIN_MODULES
+ };
+diff --git a/py/objtuple.c b/py/objtuple.c
+index 34b7664..165cacd 100644
+--- a/py/objtuple.c
++++ b/py/objtuple.c
+@@ -236,7 +236,12 @@ mp_obj_t mp_obj_new_tuple(size_t n, const mp_obj_t *items) {
+     if (n == 0) {
+         return mp_const_empty_tuple;
+     }
++    #if MICROPY_CG_TUPLE_PAD
++    // fx-CG100 tuples take more heap than stock ones (see emu/README.md)
++    mp_obj_tuple_t *o = m_malloc(sizeof(mp_obj_tuple_t) + sizeof(mp_obj_t) * n + MICROPY_CG_TUPLE_PAD);
++    #else
+     mp_obj_tuple_t *o = m_new_obj_var(mp_obj_tuple_t, mp_obj_t, n);
++    #endif
+     o->base.type = &mp_type_tuple;
+     o->len = n;
+     if (items) {
+diff --git a/py/qstr.c b/py/qstr.c
+index 08c3e25..40a7bfb 100644
+--- a/py/qstr.c
++++ b/py/qstr.c
+@@ -32,6 +32,10 @@
+ #include "py/qstr.h"
+ #include "py/gc.h"
+ 
++#if MICROPY_CG_TIMING
++#include "cgtime.h"
++#endif
++
+ // NOTE: we are using linear arrays to store and search for qstr's (unique strings, interned strings)
+ // ultimately we will replace this with a static hash table of some kind
+ // also probably need to include the length in the string data, to allow null bytes in the string
+@@ -166,15 +170,29 @@ qstr qstr_find_strn(const char *str, size_t str_len) {
+     mp_uint_t str_hash = qstr_compute_hash((const byte*)str, str_len);
+ 
+     // search pools for the data
++    #if MICROPY_CG_TIMING
++    // a miss scans every interned string: ~73 us on the calculator (bm_str)
++    cg_event(CG_EV_QSTR_FIND, 1);
++    size_t scanned = 0;
++    #endif
+     for (qstr_pool_t *pool = MP_STATE_VM(last_pool); pool != NULL; pool = pool->prev) {
+         for (const byte **q = pool->qstrs, **q_top = pool->qstrs + pool->len; q < q_top; q++) {
+             if (Q_GET_HASH(*q) == str_hash && Q_GET_LENGTH(*q) == str_len && memcmp(Q_GET_DATA(*q), str, str_len) == 0) {
++                #if MICROPY_CG_TIMING
++                cg_event(CG_EV_QSTR_SCAN, scanned + (q - pool->qstrs) + 1);
++                #endif
+                 return pool->total_prev_len + (q - pool->qstrs);
+             }
+         }
++        #if MICROPY_CG_TIMING
++        scanned += pool->len;
++        #endif
+     }
+ 
+     // not found; return null qstr
++    #if MICROPY_CG_TIMING
++    cg_event(CG_EV_QSTR_SCAN, scanned);
++    #endif
+     return 0;
+ }
+ 
+diff --git a/py/runtime.c b/py/runtime.c
+index 8f10630..983a114 100644
+--- a/py/runtime.c
++++ b/py/runtime.c
+@@ -39,6 +39,9 @@
+ #include "py/runtime.h"
+ #include "py/builtin.h"
+ #include "py/stackctrl.h"
++#if MICROPY_CG_TIMING
++#include "cgtime.h"
++#endif
+ #include "py/gc.h"
+ 
+ #if MICROPY_DEBUG_VERBOSE // print debugging info
+@@ -216,6 +219,9 @@ void mp_delete_global(qstr qst) {
+ }
+ 
+ mp_obj_t mp_unary_op(mp_unary_op_t op, mp_obj_t arg) {
++    #if MICROPY_CG_TIMING
++    cg_event(CG_EV_UNARY, 1);
++    #endif
+     DEBUG_OP_printf("unary " UINT_FMT " %q %p\n", op, mp_unary_op_method_name[op], arg);
+ 
+     if (op == MP_UNARY_OP_NOT) {
+@@ -278,6 +284,9 @@ mp_obj_t mp_unary_op(mp_unary_op_t op, mp_obj_t arg) {
+ 
+ mp_obj_t mp_binary_op(mp_binary_op_t op, mp_obj_t lhs, mp_obj_t rhs) {
+     DEBUG_OP_printf("binary " UINT_FMT " %q %p %p\n", op, mp_binary_op_method_name[op], lhs, rhs);
++    #if MICROPY_CG_TIMING
++    cg_count_binop(op, (uintptr_t)lhs, (uintptr_t)rhs);
++    #endif
+ 
+     // TODO correctly distinguish inplace operators for mutable objects
+     // lookup logic that CPython uses for +=:
+@@ -610,6 +619,10 @@ mp_obj_t mp_call_function_n_kw(mp_obj_t fun_in, size_t n_args, size_t n_kw, cons
+     // get the type
+     mp_obj_type_t *type = mp_obj_get_type(fun_in);
+ 
++    #if MICROPY_CG_TIMING
++    cg_count_call(MP_OBJ_TO_PTR(fun_in), type, n_args, n_kw);
++    #endif
++
+     // do the call
+     if (type->call != NULL) {
+         return type->call(fun_in, n_args, n_kw, args);
+@@ -917,6 +930,9 @@ too_short:
+ }
+ 
+ mp_obj_t mp_load_attr(mp_obj_t base, qstr attr) {
++    #if MICROPY_CG_TIMING
++    cg_count_attr(CG_ATTR_LOAD, (uintptr_t)base);
++    #endif
+     DEBUG_OP_printf("load attr %p.%s\n", base, qstr_str(attr));
+     // use load_method
+     mp_obj_t dest[2];
+@@ -1063,6 +1079,9 @@ void mp_load_method_maybe(mp_obj_t obj, qstr attr, mp_obj_t *dest) {
+ }
+ 
+ void mp_load_method(mp_obj_t base, qstr attr, mp_obj_t *dest) {
++    #if MICROPY_CG_TIMING
++    cg_count_attr(CG_ATTR_METHOD, (uintptr_t)base);
++    #endif
+     DEBUG_OP_printf("load method %p.%s\n", base, qstr_str(attr));
+ 
+     mp_load_method_maybe(base, attr, dest);
+@@ -1103,6 +1122,9 @@ void mp_load_method_protected(mp_obj_t obj, qstr attr, mp_obj_t *dest, bool catc
+ }
+ 
+ void mp_store_attr(mp_obj_t base, qstr attr, mp_obj_t value) {
++    #if MICROPY_CG_TIMING
++    cg_count_attr(CG_ATTR_STORE, (uintptr_t)base);
++    #endif
+     DEBUG_OP_printf("store attr %p.%s <- %p\n", base, qstr_str(attr), value);
+     mp_obj_type_t *type = mp_obj_get_type(base);
+     if (type->attr != NULL) {
+diff --git a/py/vm.c b/py/vm.c
+index 8abe65e..f80ebb8 100644
+--- a/py/vm.c
++++ b/py/vm.c
+@@ -34,6 +34,9 @@
+ #include "py/runtime.h"
+ #include "py/bc0.h"
+ #include "py/bc.h"
++#if MICROPY_CG_TIMING
++#include "cgtime.h"
++#endif
+ 
+ #if 0
+ #define TRACE(ip) printf("sp=%d ", (int)(sp - &code_state->state[0] + 1)); mp_bytecode_print2(ip, 1, code_state->fun_bc->const_table);
+@@ -127,9 +130,18 @@ mp_vm_return_kind_t mp_execute_bytecode(mp_code_state_t *code_state, volatile mp
+ #endif
+ #if MICROPY_OPT_COMPUTED_GOTO
+     #include "py/vmentrytable.h"
++    #if MICROPY_CG_TIMING
++    #define CG_COUNT_OP() do { \
++        cg_count[cg_opmap[*ip]]++; \
++        if (--cg_tick_countdown == 0) { cg_tick(); } \
++    } while (0)
++    #else
++    #define CG_COUNT_OP()
++    #endif
+     #define DISPATCH() do { \
+         TRACE(ip); \
+         MARK_EXC_IP_GLOBAL(); \
++        CG_COUNT_OP(); \
+         goto *entry_table[*ip++]; \
+     } while (0)
+     #define DISPATCH_WITH_PEND_EXC_CHECK() goto pending_exception_check
+@@ -751,6 +763,9 @@ unwind_jump:;
+                     } else {
+                         obj = MP_OBJ_FROM_PTR(&sp[-MP_OBJ_ITER_BUF_NSLOTS + 1]);
+                     }
++                    #if MICROPY_CG_TIMING
++                    cg_count_iter((uintptr_t)obj);
++                    #endif
+                     mp_obj_t value = mp_iternext_allow_raise(obj);
+                     if (value == MP_OBJ_STOP_ITERATION) {
+                         sp -= MP_OBJ_ITER_BUF_NSLOTS; // pop the exhausted iterator
